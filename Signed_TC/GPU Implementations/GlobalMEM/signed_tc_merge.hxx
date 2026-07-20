@@ -1,105 +1,67 @@
-/**
- * @file signed_tc_merge.hxx
- * @brief Merge-Based Signed Ranked Triangle Counting on GPU via Gunrock/Essentials.
- *
- * Mirrors the OpenMP pipeline from tc_merge_sign_enu.cpp exactly:
- * 1. Build a degree-ordered forward DAG.
- * 2. Segment-sort each individual vertex's Forward-CSR adjacency lists via parallel insertion.
- * 3. Step through paired neighbor pointers linearly to run intersection validations.
- *
- * Inherited Fixes from signed_tc.hxx:
- * [A] Step A: source vertex only increments to avoid double counting degrees in symmetric CSR.
- * [B] Offset arrays use int64_t to avoid overflow at scale.
- * [C] cudaDeviceSynchronize() before reading .back() from device vectors.
- * [E] Capture rank stable member pointers directly to avoid dangling host local variables in device lambdas.
- */
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <thrust/device_vector.h>
-#include <thrust/scan.h>
 #include <thrust/execution_policy.h>
+#include <thrust/scan.h>
 #include <thrust/sequence.h>
 
 namespace gunrock {
 namespace signed_tc_merge {
 
-// ============================================================
-// param / result
-// ============================================================
-
-struct param_t {
-  // No user-facing parameters needed.
-};
+struct param_t {};
 
 struct result_t {
-  std::size_t* total_balanced;
-  std::size_t* total_unbalanced;
+  std::size_t *total_balanced;
+  std::size_t *total_unbalanced;
 
-  result_t(std::size_t* b, std::size_t* u)
+  result_t(std::size_t *b, std::size_t *u)
       : total_balanced(b), total_unbalanced(u) {}
 };
 
-// ============================================================
-// problem_t  —  device storage
-// ============================================================
-
 template <typename graph_t, typename param_type, typename result_type>
 struct problem_t : gunrock::problem_t<graph_t> {
-  param_type  param;
+  param_type param;
   result_type result;
 
   using vertex_t = typename graph_t::vertex_type;
-  using edge_t   = typename graph_t::edge_type;
+  using edge_t = typename graph_t::edge_type;
   using weight_t = typename graph_t::weight_type;
 
-  // Rank array: rank_[v] = DAG rank of vertex v (ascending out-degree).
   thrust::device_vector<vertex_t> rank_;
 
-  // Forward-CSR properties built in init() using int64_t offsets [B]
-  thrust::device_vector<int64_t>  f_offsets;  // [n+1]
+  thrust::device_vector<int64_t> f_offsets;
   thrust::device_vector<vertex_t> f_edges;
   thrust::device_vector<weight_t> f_signs;
 
-  // Global accumulators (unified memory)
-  unsigned long long* d_balanced   = nullptr;
-  unsigned long long* d_unbalanced = nullptr;
+  unsigned long long *d_balanced = nullptr;
+  unsigned long long *d_unbalanced = nullptr;
 
-  problem_t(graph_t& G,
-            param_type& _param,
-            result_type& _result,
+  problem_t(graph_t &G, param_type &_param, result_type &_result,
             std::shared_ptr<gcuda::multi_context_t> _context)
-      : gunrock::problem_t<graph_t>(G, _context),
-        param(_param),
+      : gunrock::problem_t<graph_t>(G, _context), param(_param),
         result(_result) {}
 
   void init() override {
-    auto G     = this->get_graph();
+    auto G = this->get_graph();
     vertex_t n = G.get_number_of_vertices();
-    edge_t   m = G.get_number_of_edges();
+    edge_t m = G.get_number_of_edges();
 
-    // ----------------------------------------------------------------
-    // Step A: compute safe undirected degrees [A]
-    // ----------------------------------------------------------------
     thrust::device_vector<vertex_t> total_deg(n, vertex_t{0});
-    auto* tdeg_ptr = total_deg.data().get();
-    thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<edge_t>(0),
-        thrust::make_counting_iterator<edge_t>(m),
-        [G, tdeg_ptr] __device__(edge_t eid) {
-          vertex_t u = G.get_source_vertex(eid);
-          vertex_t v = G.get_destination_vertex(eid);
-          if (u == v) return;
-          math::atomic::add(&tdeg_ptr[u], vertex_t{1});
-        });
+    auto *tdeg_ptr = total_deg.data().get();
+    thrust::for_each(thrust::device, thrust::make_counting_iterator<edge_t>(0),
+                     thrust::make_counting_iterator<edge_t>(m),
+                     [G, tdeg_ptr] __device__(edge_t eid) {
+                       vertex_t u = G.get_source_vertex(eid);
+                       vertex_t v = G.get_destination_vertex(eid);
+                       if (u == v)
+                         return;
+                       math::atomic::add(&tdeg_ptr[u], vertex_t{1});
+                     });
 
-    // ----------------------------------------------------------------
-    // Step B: stable ranking permutation layout
-    // ----------------------------------------------------------------
     thrust::device_vector<vertex_t> rank_vec(n);
     thrust::sequence(thrust::device, rank_vec.begin(), rank_vec.end());
-    auto* rank_ptr = rank_vec.data().get();
+    auto *rank_ptr = rank_vec.data().get();
     thrust::sort(thrust::device, rank_ptr, rank_ptr + n,
                  [tdeg_ptr] __device__(vertex_t a, vertex_t b) {
                    if (tdeg_ptr[a] != tdeg_ptr[b])
@@ -108,78 +70,75 @@ struct problem_t : gunrock::problem_t<graph_t> {
                  });
 
     rank_.resize(n);
-    auto* rinv_ptr = rank_.data().get();
-    thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<vertex_t>(0),
-        thrust::make_counting_iterator<vertex_t>(n),
-        [rank_ptr, rinv_ptr] __device__(vertex_t i) {
-          rinv_ptr[rank_ptr[i]] = i;
-        });
+    auto *rinv_ptr = rank_.data().get();
+    thrust::for_each(thrust::device,
+                     thrust::make_counting_iterator<vertex_t>(0),
+                     thrust::make_counting_iterator<vertex_t>(n),
+                     [rank_ptr, rinv_ptr] __device__(vertex_t i) {
+                       rinv_ptr[rank_ptr[i]] = i;
+                     });
 
-    auto* rank_stable = rank_.data().get(); // FIX [E]
+    auto *rank_stable = rank_.data().get();
 
-    // ----------------------------------------------------------------
-    // Step C: build standard Forward DAG CSR using int64_t [B]
-    // ----------------------------------------------------------------
     f_offsets.assign(n + 1, int64_t{0});
-    auto* f_off_ptr = f_offsets.data().get();
+    auto *f_off_ptr = f_offsets.data().get();
 
     thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<edge_t>(0),
+        thrust::device, thrust::make_counting_iterator<edge_t>(0),
         thrust::make_counting_iterator<edge_t>(m),
         [G, rank_stable, f_off_ptr] __device__(edge_t eid) {
           vertex_t u = G.get_source_vertex(eid);
           vertex_t v = G.get_destination_vertex(eid);
-          if (u == v) return;
-          if (rank_stable[u] >= rank_stable[v]) return;
+          if (u == v)
+            return;
+          if (rank_stable[u] >= rank_stable[v])
+            return;
 
-          math::atomic::add(reinterpret_cast<unsigned long long*>(f_off_ptr + u + 1), 1ULL);
+          math::atomic::add(
+              reinterpret_cast<unsigned long long *>(f_off_ptr + u + 1), 1ULL);
         });
 
-    thrust::inclusive_scan(thrust::device, f_offsets.begin(), f_offsets.end(), f_offsets.begin());
-    cudaDeviceSynchronize(); // FIX [C]
+    thrust::inclusive_scan(thrust::device, f_offsets.begin(), f_offsets.end(),
+                           f_offsets.begin());
+    cudaDeviceSynchronize();
     int64_t f_m = f_offsets.back();
 
     f_edges.resize(f_m);
     f_signs.resize(f_m);
 
     thrust::device_vector<int64_t> f_cur = f_offsets;
-    auto* f_cur_ptr   = f_cur.data().get();
-    auto* f_edge_ptr  = f_edges.data().get();
-    auto* f_sign_ptr  = f_signs.data().get();
+    auto *f_cur_ptr = f_cur.data().get();
+    auto *f_edge_ptr = f_edges.data().get();
+    auto *f_sign_ptr = f_signs.data().get();
 
     thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<edge_t>(0),
+        thrust::device, thrust::make_counting_iterator<edge_t>(0),
         thrust::make_counting_iterator<edge_t>(m),
-        [G, rank_stable, f_cur_ptr, f_edge_ptr, f_sign_ptr] __device__(edge_t eid) {
+        [G, rank_stable, f_cur_ptr, f_edge_ptr,
+         f_sign_ptr] __device__(edge_t eid) {
           vertex_t u = G.get_source_vertex(eid);
           vertex_t v = G.get_destination_vertex(eid);
-          if (u == v) return;
-          if (rank_stable[u] >= rank_stable[v]) return;
+          if (u == v)
+            return;
+          if (rank_stable[u] >= rank_stable[v])
+            return;
 
-          int64_t idx = math::atomic::add(reinterpret_cast<unsigned long long*>(&f_cur_ptr[u]), 1ULL);
+          int64_t idx = math::atomic::add(
+              reinterpret_cast<unsigned long long *>(&f_cur_ptr[u]), 1ULL);
           f_edge_ptr[idx] = v;
           f_sign_ptr[idx] = G.get_edge_weight(eid);
         });
 
-    // ----------------------------------------------------------------
-    // Step D: Inplace sort each vertex's Forward-CSR adjacency sub-list.
-    // Necessary to match requirements for linear merge intersections.
-    // ----------------------------------------------------------------
     thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<vertex_t>(0),
+        thrust::device, thrust::make_counting_iterator<vertex_t>(0),
         thrust::make_counting_iterator<vertex_t>(n),
         [f_off_ptr, f_edge_ptr, f_sign_ptr] __device__(vertex_t u) {
           int64_t start = f_off_ptr[u];
-          int64_t end   = f_off_ptr[u + 1];
-          int64_t len   = end - start;
-          if (len < 2) return;
+          int64_t end = f_off_ptr[u + 1];
+          int64_t len = end - start;
+          if (len < 2)
+            return;
 
-          // In-place dual sorting loop tailored for GPU thread blocks
           for (int64_t i = start + 1; i < end; ++i) {
             vertex_t key_e = f_edge_ptr[i];
             weight_t key_s = f_sign_ptr[i];
@@ -194,58 +153,59 @@ struct problem_t : gunrock::problem_t<graph_t> {
           }
         });
 
-    cudaMallocManaged(&d_balanced,   sizeof(unsigned long long));
+    cudaMallocManaged(&d_balanced, sizeof(unsigned long long));
     cudaMallocManaged(&d_unbalanced, sizeof(unsigned long long));
-    *d_balanced   = 0ULL;
+    *d_balanced = 0ULL;
     *d_unbalanced = 0ULL;
   }
 
   void reset() override {
-    if (d_balanced)   *d_balanced   = 0ULL;
-    if (d_unbalanced) *d_unbalanced = 0ULL;
+    if (d_balanced)
+      *d_balanced = 0ULL;
+    if (d_unbalanced)
+      *d_unbalanced = 0ULL;
   }
 
   ~problem_t() {
-    if (d_balanced)   { cudaFree(d_balanced);   d_balanced   = nullptr; }
-    if (d_unbalanced) { cudaFree(d_unbalanced); d_unbalanced = nullptr; }
+    if (d_balanced) {
+      cudaFree(d_balanced);
+      d_balanced = nullptr;
+    }
+    if (d_unbalanced) {
+      cudaFree(d_unbalanced);
+      d_unbalanced = nullptr;
+    }
   }
 };
 
-// ============================================================
-// enactor_t
-// ============================================================
-
-template <typename problem_t>
-struct enactor_t : gunrock::enactor_t<problem_t> {
+template <typename problem_t> struct enactor_t : gunrock::enactor_t<problem_t> {
   using vertex_t = typename problem_t::vertex_t;
   using weight_t = typename problem_t::weight_t;
 
-  enactor_t(problem_t* _problem,
+  enactor_t(problem_t *_problem,
             std::shared_ptr<gcuda::multi_context_t> _context,
             enactor_properties_t _properties = enactor_properties_t{})
       : gunrock::enactor_t<problem_t>(_problem, _context, _properties) {}
 
-  void loop(gcuda::multi_context_t& context) override {
+  void loop(gcuda::multi_context_t &context) override {
     auto P = this->get_problem();
     vertex_t n = P->get_graph().get_number_of_vertices();
 
-    auto* f_off   = P->f_offsets.data().get();
-    auto* f_e     = P->f_edges.data().get();
-    auto* f_s     = P->f_signs.data().get();
-    auto* rank    = P->rank_.data().get();
-    auto* d_bal   = P->d_balanced;
-    auto* d_unbal = P->d_unbalanced;
+    auto *f_off = P->f_offsets.data().get();
+    auto *f_e = P->f_edges.data().get();
+    auto *f_s = P->f_signs.data().get();
+    auto *rank = P->rank_.data().get();
+    auto *d_bal = P->d_balanced;
+    auto *d_unbal = P->d_unbalanced;
 
-    // FIX [D]: Loop over vertices to mirror the CPU implementation exactly
     thrust::for_each(
-        thrust::device,
-        thrust::make_counting_iterator<vertex_t>(0),
+        thrust::device, thrust::make_counting_iterator<vertex_t>(0),
         thrust::make_counting_iterator<vertex_t>(n),
         [f_off, f_e, f_s, rank, d_bal, d_unbal] __device__(vertex_t v) {
           int64_t begin_v = f_off[v];
-          int64_t end_v   = f_off[v + 1];
+          int64_t end_v = f_off[v + 1];
 
-          unsigned long long local_b  = 0;
+          unsigned long long local_b = 0;
           unsigned long long local_ub = 0;
 
           uint32_t rank_v = rank[v];
@@ -256,11 +216,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
             weight_t sign_vw = f_s[e];
 
             int64_t a_begin = begin_v;
-            int64_t a_end   = end_v;
+            int64_t a_end = end_v;
             int64_t b_begin = f_off[w];
-            int64_t b_end   = f_off[w + 1];
+            int64_t b_end = f_off[w + 1];
 
-            // Linear Merge Intersection Logic matching intersect_signed_ranked
             while (a_begin < a_end && b_begin < b_end) {
               vertex_t x = f_e[a_begin];
               vertex_t y = f_e[b_begin];
@@ -283,29 +242,25 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
             }
           }
 
-          if (local_b)  math::atomic::add(d_bal,   local_b);
-          if (local_ub) math::atomic::add(d_unbal, local_ub);
+          if (local_b)
+            math::atomic::add(d_bal, local_b);
+          if (local_ub)
+            math::atomic::add(d_unbal, local_ub);
         });
 
     context.get_context(0)->synchronize();
 
-    *P->result.total_balanced   = (std::size_t)*d_bal;
+    *P->result.total_balanced = (std::size_t)*d_bal;
     *P->result.total_unbalanced = (std::size_t)*d_unbal;
   }
 
-  bool is_converged(gcuda::multi_context_t& context) override {
+  bool is_converged(gcuda::multi_context_t &context) override {
     return this->iteration == 1;
   }
 };
 
-// ============================================================
-// run()
-// ============================================================
-
 template <typename graph_t>
-float run(graph_t& G,
-          param_t& param,
-          result_t& result,
+float run(graph_t &G, param_t &param, result_t &result,
           std::shared_ptr<gcuda::multi_context_t> context) {
   using problem_type = problem_t<graph_t, param_t, result_t>;
   using enactor_type = enactor_t<problem_type>;
@@ -321,5 +276,5 @@ float run(graph_t& G,
   return enactor.enact();
 }
 
-}  // namespace signed_tc_merge
-}  // namespace gunrock
+} // namespace signed_tc_merge
+} // namespace gunrock

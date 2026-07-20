@@ -1,102 +1,40 @@
-/**
- * @file signed_tc_shmem.hxx
- * @brief Shared-Memory Split-CSR Signed Triangle Counting on GPU.
- *
- * Mirrors signed_tc.hxx (split pos/neg CSR, merge-intersection) but
- * moves the inner intersection work into shared memory.
- *
- * Strategy
- * --------
- * The global-mem version assigns one thread per vertex u (via thrust::for_each)
- * and runs the four merge-intersections entirely from global memory.
- *
- * Here we launch a custom CUDA kernel where each thread-block processes one
- * vertex u via a grid-stride loop. The block cooperatively loads u's pos/neg
- * forward-neighbor lists into shared memory tiles (TILE_SZ entries at a time
- * when lists are larger than shared memory). For each forward neighbor v, the
- * per-block threads sweep v's lists from global memory in parallel and
- * binary-search each element against the shared-mem tile of u's list.
- * Binary search is O(log TILE_SZ) against shared mem vs O(deg(u)) sequential
- * scan against global mem in the global-mem version.
- *
- * Tiled shared-memory layout (per block):
- *   shmem = [ vertex_t pos_u[TILE_SZ] | vertex_t neg_u[TILE_SZ]
- *           | ull blk_bal | ull blk_unbal ]
- * All shared state (including block accumulators) lives in the single dynamic
- * smem allocation to avoid static/dynamic smem aliasing issues.
- *
- * Key fixes vs. original:
- *   [F1] shmem_contains extracted to __device__ free function  in-kernel
- *        lambdas that capture __shared__ pointers can miscompile in nvcc and
- *        cause cudaErrorLaunchFailure.
- *   [F2] Block accumulators (blk_bal, blk_unbal) placed in dynamic smem to
- *        avoid undefined layout when mixing static + extern __shared__.
- *   [F3] Grid-stride launch: grid = min(n, MAX_BLOCKS) instead of n blocks.
- *        Prevents scheduler overload and lets the hardware pace wave launches.
- *        Each block resets its accumulators at the top of each vertex loop.
- *   [F4] cudaDeviceSynchronize() barriers between all major Thrust phases in
- *        init() to release temporary scratch allocations before the next phase,
- *        preventing get_temporary_buffer failures on large graphs.
- *   [F5] smem_bytes includes space for the two ull accumulators.
- *   [F6] __syncthreads() after blk_bal/blk_unbal init (was missing the very
- *        first sync when multiple vertices are processed per block).
- *
- * Inherits all fixes [A-E] from signed_tc.hxx.
- */
 #pragma once
 
 #include <algorithm>
-#include <vector>
 #include <gunrock/algorithms/algorithms.hxx>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+#include <vector>
 
 namespace gunrock {
 namespace signed_tc_shmem {
 
-// ---------------------------------------------------------------------------
-// Tunables
-// ---------------------------------------------------------------------------
-/// Number of vertices to cache per list (pos or neg) in shared memory.
-/// 128 * 4 B = 512 B per list; two lists = 1 KB; leaves ample smem for
-/// registers and the two ull accumulators.  Larger tiles (256, 512) reduce
-/// tile-loop iterations but cut occupancy; 128 is a good default.
 static constexpr int TILE_SZ = 128;
 
-/// Threads per block.  128 = 4 warps; enough parallelism for the probe loop
-/// while keeping register pressure and smem footprint modest.
 static constexpr int BLOCK_DIM = 128;
 
-/// Maximum grid size.  Caps the number of simultaneously resident blocks to
-/// avoid overwhelming the CTA scheduler.  65535 is the hardware maximum for
-/// a single dimension; in practice a value around 3276865535 works well.
 static constexpr int MAX_BLOCKS = 65535;
 
-// ---------------------------------------------------------------------------
-// [F1] Binary search on a sorted shared-memory tile  free __device__ fn.
-//      Must live outside the kernel body to avoid nvcc lambda-capture bugs.
-// ---------------------------------------------------------------------------
 template <typename vertex_t>
-__device__ __forceinline__ bool shmem_contains(
-    const vertex_t *__restrict__ sh, int tile_len, vertex_t key)
-{
+__device__ __forceinline__ bool shmem_contains(const vertex_t *__restrict__ sh,
+                                               int tile_len, vertex_t key) {
   int lo = 0, hi = tile_len - 1;
   while (lo <= hi) {
     int mid = (lo + hi) >> 1;
     vertex_t v = sh[mid];
-    if (v == key) return true;
-    if (v < key)  lo = mid + 1;
-    else           hi = mid - 1;
+    if (v == key)
+      return true;
+    if (v < key)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
   }
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// param / result
-// ---------------------------------------------------------------------------
 struct param_t {};
 
 struct result_t {
@@ -106,25 +44,22 @@ struct result_t {
       : total_balanced(b), total_unbalanced(u) {}
 };
 
-// ---------------------------------------------------------------------------
-// problem_t  (identical DAG + split-CSR build to signed_tc.hxx)
-// ---------------------------------------------------------------------------
 template <typename graph_t, typename param_type, typename result_type>
 struct problem_t : gunrock::problem_t<graph_t> {
-  param_type  param;
+  param_type param;
   result_type result;
 
   using vertex_t = typename graph_t::vertex_type;
-  using edge_t   = typename graph_t::edge_type;
+  using edge_t = typename graph_t::edge_type;
 
   thrust::device_vector<vertex_t> rank_;
 
-  thrust::device_vector<int64_t>  pos_offsets;
+  thrust::device_vector<int64_t> pos_offsets;
   thrust::device_vector<vertex_t> pos_edges;
-  thrust::device_vector<int64_t>  neg_offsets;
+  thrust::device_vector<int64_t> neg_offsets;
   thrust::device_vector<vertex_t> neg_edges;
 
-  unsigned long long *d_balanced   = nullptr;
+  unsigned long long *d_balanced = nullptr;
   unsigned long long *d_unbalanced = nullptr;
 
   problem_t(graph_t &G, param_type &_param, result_type &_result,
@@ -133,26 +68,24 @@ struct problem_t : gunrock::problem_t<graph_t> {
         result(_result) {}
 
   void init() override {
-    auto G     = this->get_graph();
+    auto G = this->get_graph();
     vertex_t n = G.get_number_of_vertices();
-    edge_t   m = G.get_number_of_edges();
+    edge_t m = G.get_number_of_edges();
 
-    // [A] Degree over source endpoints only
     thrust::device_vector<vertex_t> total_deg(n, vertex_t{0});
     auto *tdeg_ptr = total_deg.data().get();
-    thrust::for_each(thrust::device,
-                     thrust::make_counting_iterator<edge_t>(0),
+    thrust::for_each(thrust::device, thrust::make_counting_iterator<edge_t>(0),
                      thrust::make_counting_iterator<edge_t>(m),
                      [G, tdeg_ptr] __device__(edge_t eid) {
                        vertex_t u = G.get_source_vertex(eid);
                        vertex_t v = G.get_destination_vertex(eid);
-                       if (u == v) return;
+                       if (u == v)
+                         return;
                        math::atomic::add(&tdeg_ptr[u], vertex_t{1});
                      });
-    // [F4] sync so the next Thrust call can reclaim scratch buffers
+
     cudaDeviceSynchronize();
 
-    // Rank = position in degree-ascending, vertex-id-ascending sort
     thrust::device_vector<vertex_t> rank_vec(n);
     thrust::sequence(thrust::device, rank_vec.begin(), rank_vec.end());
     auto *rank_ptr = rank_vec.data().get();
@@ -162,7 +95,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
                      return tdeg_ptr[a] < tdeg_ptr[b];
                    return a < b;
                  });
-    cudaDeviceSynchronize(); // [F4]
+    cudaDeviceSynchronize();
 
     rank_.resize(n);
     auto *rinv_ptr = rank_.data().get();
@@ -172,11 +105,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
                      [rank_ptr, rinv_ptr] __device__(vertex_t i) {
                        rinv_ptr[rank_ptr[i]] = i;
                      });
-    cudaDeviceSynchronize(); // [F4]
+    cudaDeviceSynchronize();
 
-    auto *rank_stable = rank_.data().get(); // [E] stable ptr
+    auto *rank_stable = rank_.data().get();
 
-    // Count pos/neg forward edges per vertex
     pos_offsets.assign(n + 1, int64_t{0});
     neg_offsets.assign(n + 1, int64_t{0});
     auto *pos_off_ptr = pos_offsets.data().get();
@@ -188,24 +120,27 @@ struct problem_t : gunrock::problem_t<graph_t> {
         [G, rank_stable, pos_off_ptr, neg_off_ptr] __device__(edge_t eid) {
           vertex_t u = G.get_source_vertex(eid);
           vertex_t v = G.get_destination_vertex(eid);
-          if (u == v) return;
-          if (rank_stable[u] >= rank_stable[v]) return;
+          if (u == v)
+            return;
+          if (rank_stable[u] >= rank_stable[v])
+            return;
           auto w = G.get_edge_weight(eid);
           if (w > 0.0f)
             math::atomic::add(
-                reinterpret_cast<unsigned long long *>(pos_off_ptr + u + 1), 1ULL);
+                reinterpret_cast<unsigned long long *>(pos_off_ptr + u + 1),
+                1ULL);
           else
             math::atomic::add(
-                reinterpret_cast<unsigned long long *>(neg_off_ptr + u + 1), 1ULL);
+                reinterpret_cast<unsigned long long *>(neg_off_ptr + u + 1),
+                1ULL);
         });
-    cudaDeviceSynchronize(); // [F4]
+    cudaDeviceSynchronize();
 
     thrust::inclusive_scan(thrust::device, pos_offsets.begin(),
                            pos_offsets.end(), pos_offsets.begin());
     thrust::inclusive_scan(thrust::device, neg_offsets.begin(),
                            neg_offsets.end(), neg_offsets.begin());
 
-    // [C] sync before .back()
     cudaDeviceSynchronize();
     int64_t pos_m = pos_offsets.back();
     int64_t neg_m = neg_offsets.back();
@@ -214,8 +149,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
 
     thrust::device_vector<int64_t> pos_cur = pos_offsets;
     thrust::device_vector<int64_t> neg_cur = neg_offsets;
-    auto *pos_cur_ptr  = pos_cur.data().get();
-    auto *neg_cur_ptr  = neg_cur.data().get();
+    auto *pos_cur_ptr = pos_cur.data().get();
+    auto *neg_cur_ptr = neg_cur.data().get();
     auto *pos_edge_ptr = pos_edges.data().get();
     auto *neg_edge_ptr = neg_edges.data().get();
 
@@ -226,8 +161,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
          neg_edge_ptr] __device__(edge_t eid) {
           vertex_t u = G.get_source_vertex(eid);
           vertex_t v = G.get_destination_vertex(eid);
-          if (u == v) return;
-          if (rank_stable[u] >= rank_stable[v]) return;
+          if (u == v)
+            return;
+          if (rank_stable[u] >= rank_stable[v])
+            return;
           auto w = G.get_edge_weight(eid);
           if (w > 0.0f) {
             int64_t idx = math::atomic::add(
@@ -239,12 +176,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
             neg_edge_ptr[idx] = v;
           }
         });
-    cudaDeviceSynchronize(); // [F4]
+    cudaDeviceSynchronize();
 
-    // Sort each vertex's pos/neg lists on the host for binary-search
-    // intersection.  Copying to host, std::sort, copy back is simpler and
-    // avoids ALL Thrust scratch-allocation issues (thrust::sort(thrust::seq)
-    // internally calls get_temporary_buffer even with the sequential policy).
     {
       std::vector<vertex_t> h_pos(pos_m), h_neg(neg_m);
       thrust::copy(pos_edges.begin(), pos_edges.end(), h_pos.begin());
@@ -255,8 +188,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
       thrust::copy(neg_offsets.begin(), neg_offsets.end(), h_neg_off.begin());
 
       for (vertex_t u = 0; u < n; ++u) {
-        std::sort(h_pos.data() + h_pos_off[u], h_pos.data() + h_pos_off[u+1]);
-        std::sort(h_neg.data() + h_neg_off[u], h_neg.data() + h_neg_off[u+1]);
+        std::sort(h_pos.data() + h_pos_off[u], h_pos.data() + h_pos_off[u + 1]);
+        std::sort(h_neg.data() + h_neg_off[u], h_neg.data() + h_neg_off[u + 1]);
       }
 
       thrust::copy(h_pos.begin(), h_pos.end(), pos_edges.begin());
@@ -264,26 +197,31 @@ struct problem_t : gunrock::problem_t<graph_t> {
       cudaDeviceSynchronize();
     }
 
-    cudaMalloc(&d_balanced,   sizeof(unsigned long long));
+    cudaMalloc(&d_balanced, sizeof(unsigned long long));
     cudaMalloc(&d_unbalanced, sizeof(unsigned long long));
-    cudaMemset(d_balanced,   0, sizeof(unsigned long long));
+    cudaMemset(d_balanced, 0, sizeof(unsigned long long));
     cudaMemset(d_unbalanced, 0, sizeof(unsigned long long));
   }
 
   void reset() override {
-    if (d_balanced)   cudaMemset(d_balanced,   0, sizeof(unsigned long long));
-    if (d_unbalanced) cudaMemset(d_unbalanced, 0, sizeof(unsigned long long));
+    if (d_balanced)
+      cudaMemset(d_balanced, 0, sizeof(unsigned long long));
+    if (d_unbalanced)
+      cudaMemset(d_unbalanced, 0, sizeof(unsigned long long));
   }
 
   ~problem_t() {
-    if (d_balanced)   { cudaFree(d_balanced);   d_balanced   = nullptr; }
-    if (d_unbalanced) { cudaFree(d_unbalanced); d_unbalanced = nullptr; }
+    if (d_balanced) {
+      cudaFree(d_balanced);
+      d_balanced = nullptr;
+    }
+    if (d_unbalanced) {
+      cudaFree(d_unbalanced);
+      d_unbalanced = nullptr;
+    }
   }
 };
 
-// ---------------------------------------------------------------------------
-// Shared-memory kernel
-// ---------------------------------------------------------------------------
 /**
  * Grid-stride: each block processes vertices u = blockIdx.x, blockIdx.x +
  * gridDim.x, ... so grid can be << n while all vertices are covered.
@@ -298,142 +236,140 @@ struct problem_t : gunrock::problem_t<graph_t> {
  * lifetime) because one block now handles multiple vertices.
  */
 __global__ void tc_shmem_intersect_kernel(
-    int n,
-    const int64_t *__restrict__ pos_off,
-    const int     *__restrict__ pos_e,
-    const int64_t *__restrict__ neg_off,
-    const int     *__restrict__ neg_e,
-    unsigned long long *d_bal,
-    unsigned long long *d_unbal)
-{
-  using vertex_t = int;  // concrete; avoids namespace lookup ambiguity
-  // [F2] All shared state in one dynamic allocation  no static __shared__ vars.
-  // Accumulators must be 8-byte aligned; pad the vertex_t arrays to a multiple
-  // of 8 bytes before placing the ull accumulators.
+    int n, const int64_t *__restrict__ pos_off, const int *__restrict__ pos_e,
+    const int64_t *__restrict__ neg_off, const int *__restrict__ neg_e,
+    unsigned long long *d_bal, unsigned long long *d_unbal) {
+  using vertex_t = int;
+
   extern __shared__ char smem_raw[];
-  vertex_t           *sh_pos    = reinterpret_cast<vertex_t*>(smem_raw);
-  vertex_t           *sh_neg    = sh_pos + TILE_SZ;
-  // offset of accumulators: round 2*TILE_SZ*sizeof(vertex_t) up to 8-byte boundary
-  constexpr size_t tile_bytes   = 2 * TILE_SZ * sizeof(vertex_t);
-  constexpr size_t acc_offset   = (tile_bytes + 7) & ~size_t(7);
-  unsigned long long *blk_bal   = reinterpret_cast<unsigned long long*>(smem_raw + acc_offset);
+  vertex_t *sh_pos = reinterpret_cast<vertex_t *>(smem_raw);
+  vertex_t *sh_neg = sh_pos + TILE_SZ;
+
+  constexpr size_t tile_bytes = 2 * TILE_SZ * sizeof(vertex_t);
+  constexpr size_t acc_offset = (tile_bytes + 7) & ~size_t(7);
+  unsigned long long *blk_bal =
+      reinterpret_cast<unsigned long long *>(smem_raw + acc_offset);
   unsigned long long *blk_unbal = blk_bal + 1;
 
-  // [F3] Grid-stride loop over vertices
   for (vertex_t u = static_cast<vertex_t>(blockIdx.x); u < n;
        u += static_cast<vertex_t>(gridDim.x)) {
 
-    // Reset accumulators for this vertex
-    if (threadIdx.x == 0) { *blk_bal = 0ULL; *blk_unbal = 0ULL; }
-    __syncthreads(); // [F6]
+    if (threadIdx.x == 0) {
+      *blk_bal = 0ULL;
+      *blk_unbal = 0ULL;
+    }
+    __syncthreads();
 
     const int64_t pu0 = pos_off[u], pu1 = pos_off[u + 1];
     const int64_t nu0 = neg_off[u], nu1 = neg_off[u + 1];
     const int64_t pos_len_u = pu1 - pu0;
     const int64_t neg_len_u = nu1 - nu0;
 
-    // ---- iterate forward neighbors v of u via pos list --------------------
     for (int64_t e = pu0; e < pu1; ++e) {
-      vertex_t v = pos_e[e]; // sign(u,v) = +1
+      vertex_t v = pos_e[e];
 
       const int64_t pv0 = pos_off[v], pv1 = pos_off[v + 1];
       const int64_t nv0 = neg_off[v], nv1 = neg_off[v + 1];
       const int64_t plen_v = pv1 - pv0;
       const int64_t nlen_v = nv1 - nv0;
 
-            unsigned long long thr_b = 0, thr_ub = 0;
+      unsigned long long thr_b = 0, thr_ub = 0;
 
-      // Cases 1+3: load sh_pos once, probe pos(v) AND neg(v)
       for (int64_t tile_u = 0; tile_u < pos_len_u; tile_u += TILE_SZ) {
         int tile_len_u = (int)min((int64_t)TILE_SZ, pos_len_u - tile_u);
         for (int i = threadIdx.x; i < tile_len_u; i += blockDim.x)
           sh_pos[i] = pos_e[pu0 + tile_u + i];
         __syncthreads();
         for (int64_t j = threadIdx.x; j < plen_v; j += blockDim.x)
-          if (shmem_contains(sh_pos, tile_len_u, pos_e[pv0 + j])) thr_b++;  // case 1
+          if (shmem_contains(sh_pos, tile_len_u, pos_e[pv0 + j]))
+            thr_b++;
         for (int64_t j = threadIdx.x; j < nlen_v; j += blockDim.x)
-          if (shmem_contains(sh_pos, tile_len_u, neg_e[nv0 + j])) thr_ub++; // case 3
+          if (shmem_contains(sh_pos, tile_len_u, neg_e[nv0 + j]))
+            thr_ub++;
         __syncthreads();
       }
 
-      // Cases 2+4: load sh_neg once, probe neg(v) AND pos(v)
       for (int64_t tile_u = 0; tile_u < neg_len_u; tile_u += TILE_SZ) {
         int tile_len_u = (int)min((int64_t)TILE_SZ, neg_len_u - tile_u);
         for (int i = threadIdx.x; i < tile_len_u; i += blockDim.x)
           sh_neg[i] = neg_e[nu0 + tile_u + i];
         __syncthreads();
         for (int64_t j = threadIdx.x; j < nlen_v; j += blockDim.x)
-          if (shmem_contains(sh_neg, tile_len_u, neg_e[nv0 + j])) thr_b++;  // case 2
+          if (shmem_contains(sh_neg, tile_len_u, neg_e[nv0 + j]))
+            thr_b++;
         for (int64_t j = threadIdx.x; j < plen_v; j += blockDim.x)
-          if (shmem_contains(sh_neg, tile_len_u, pos_e[pv0 + j])) thr_ub++; // case 4
+          if (shmem_contains(sh_neg, tile_len_u, pos_e[pv0 + j]))
+            thr_ub++;
         __syncthreads();
       }
 
-      if (thr_b)  atomicAdd(blk_bal,   thr_b);
-      if (thr_ub) atomicAdd(blk_unbal, thr_ub);
+      if (thr_b)
+        atomicAdd(blk_bal, thr_b);
+      if (thr_ub)
+        atomicAdd(blk_unbal, thr_ub);
       __syncthreads();
     }
 
-    // ---- iterate forward neighbors v of u via neg list --------------------
     for (int64_t e = nu0; e < nu1; ++e) {
-      vertex_t v = neg_e[e]; // sign(u,v) = -1
+      vertex_t v = neg_e[e];
 
       const int64_t pv0 = pos_off[v], pv1 = pos_off[v + 1];
       const int64_t nv0 = neg_off[v], nv1 = neg_off[v + 1];
       const int64_t plen_v = pv1 - pv0;
       const int64_t nlen_v = nv1 - nv0;
 
-            unsigned long long thr_b = 0, thr_ub = 0;
+      unsigned long long thr_b = 0, thr_ub = 0;
 
-      // Cases 5+7: load sh_pos once, probe neg(v) AND pos(v)
       for (int64_t tile_u = 0; tile_u < pos_len_u; tile_u += TILE_SZ) {
         int tile_len_u = (int)min((int64_t)TILE_SZ, pos_len_u - tile_u);
         for (int i = threadIdx.x; i < tile_len_u; i += blockDim.x)
           sh_pos[i] = pos_e[pu0 + tile_u + i];
         __syncthreads();
         for (int64_t j = threadIdx.x; j < nlen_v; j += blockDim.x)
-          if (shmem_contains(sh_pos, tile_len_u, neg_e[nv0 + j])) thr_b++;  // case 5
+          if (shmem_contains(sh_pos, tile_len_u, neg_e[nv0 + j]))
+            thr_b++;
         for (int64_t j = threadIdx.x; j < plen_v; j += blockDim.x)
-          if (shmem_contains(sh_pos, tile_len_u, pos_e[pv0 + j])) thr_ub++; // case 7
+          if (shmem_contains(sh_pos, tile_len_u, pos_e[pv0 + j]))
+            thr_ub++;
         __syncthreads();
       }
 
-      // Cases 6+8: load sh_neg once, probe pos(v) AND neg(v)
       for (int64_t tile_u = 0; tile_u < neg_len_u; tile_u += TILE_SZ) {
         int tile_len_u = (int)min((int64_t)TILE_SZ, neg_len_u - tile_u);
         for (int i = threadIdx.x; i < tile_len_u; i += blockDim.x)
           sh_neg[i] = neg_e[nu0 + tile_u + i];
         __syncthreads();
         for (int64_t j = threadIdx.x; j < plen_v; j += blockDim.x)
-          if (shmem_contains(sh_neg, tile_len_u, pos_e[pv0 + j])) thr_b++;  // case 6
+          if (shmem_contains(sh_neg, tile_len_u, pos_e[pv0 + j]))
+            thr_b++;
         for (int64_t j = threadIdx.x; j < nlen_v; j += blockDim.x)
-          if (shmem_contains(sh_neg, tile_len_u, neg_e[nv0 + j])) thr_ub++; // case 8
+          if (shmem_contains(sh_neg, tile_len_u, neg_e[nv0 + j]))
+            thr_ub++;
         __syncthreads();
       }
 
-      if (thr_b)  atomicAdd(blk_bal,   thr_b);
-      if (thr_ub) atomicAdd(blk_unbal, thr_ub);
+      if (thr_b)
+        atomicAdd(blk_bal, thr_b);
+      if (thr_ub)
+        atomicAdd(blk_unbal, thr_ub);
       __syncthreads();
     }
 
-    // One global atomic per block per vertex (much cheaper than per-thread)
     __syncthreads();
     if (threadIdx.x == 0) {
-      if (*blk_bal)   atomicAdd(d_bal,   *blk_bal);
-      if (*blk_unbal) atomicAdd(d_unbal, *blk_unbal);
+      if (*blk_bal)
+        atomicAdd(d_bal, *blk_bal);
+      if (*blk_unbal)
+        atomicAdd(d_unbal, *blk_unbal);
     }
-    // sync before next vertex resets accumulators
+
     __syncthreads();
   }
 }
 
-// ---------------------------------------------------------------------------
-// enactor_t
-// ---------------------------------------------------------------------------
-template <typename problem_t>
-struct enactor_t : gunrock::enactor_t<problem_t> {
+template <typename problem_t> struct enactor_t : gunrock::enactor_t<problem_t> {
   using vertex_t = typename problem_t::vertex_t;
-  using edge_t   = typename problem_t::edge_t;
+  using edge_t = typename problem_t::edge_t;
   using weight_t = typename problem_t::weight_t;
 
   enactor_t(problem_t *_problem,
@@ -449,29 +385,28 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     auto *pos_off = P->pos_offsets.data().get();
     auto *neg_off = P->neg_offsets.data().get();
-    auto *pos_e   = P->pos_edges.data().get();
-    auto *neg_e   = P->neg_edges.data().get();
-    auto *d_bal   = P->d_balanced;
+    auto *pos_e = P->pos_edges.data().get();
+    auto *neg_e = P->neg_edges.data().get();
+    auto *d_bal = P->d_balanced;
     auto *d_unbal = P->d_unbalanced;
 
-    // [F5] smem: two vertex_t tiles (aligned to 8B) + two ull accumulators
     constexpr size_t tile_bytes = 2 * TILE_SZ * sizeof(vertex_t);
     constexpr size_t acc_offset = (tile_bytes + 7) & ~size_t(7);
     std::size_t smem_bytes = acc_offset + 2 * sizeof(unsigned long long);
 
-    // [F3] Grid-stride: cap grid so scheduler isn't flooded with 100K blocks
     int grid = (int)min((vertex_t)MAX_BLOCKS, n);
 
-    tc_shmem_intersect_kernel
-        <<<grid, BLOCK_DIM, smem_bytes>>>(n, pos_off, pos_e, neg_off, neg_e,
-                                          d_bal, d_unbal);
+    tc_shmem_intersect_kernel<<<grid, BLOCK_DIM, smem_bytes>>>(
+        n, pos_off, pos_e, neg_off, neg_e, d_bal, d_unbal);
 
     context.get_context(0)->synchronize();
 
     unsigned long long h_bal = 0, h_unbal = 0;
-    cudaMemcpy(&h_bal,   d_bal,   sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_unbal, d_unbal, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    *P->result.total_balanced   = (std::size_t)h_bal;
+    cudaMemcpy(&h_bal, d_bal, sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_unbal, d_unbal, sizeof(unsigned long long),
+               cudaMemcpyDeviceToHost);
+    *P->result.total_balanced = (std::size_t)h_bal;
     *P->result.total_unbalanced = (std::size_t)h_unbal;
   }
 
@@ -480,9 +415,6 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   }
 };
 
-// ---------------------------------------------------------------------------
-// run()
-// ---------------------------------------------------------------------------
 template <typename graph_t>
 float run(graph_t &G, param_t &param, result_t &result,
           std::shared_ptr<gcuda::multi_context_t> context) {

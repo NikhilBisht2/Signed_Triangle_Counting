@@ -1,8 +1,3 @@
-/**
- * @file signed_tc_merge.cu
- * @brief Driver for Merge-Based Signed Ranked Triangle Counting on GPU (Gunrock/Essentials).
- */
-
 #include <iostream>
 #include <string>
 
