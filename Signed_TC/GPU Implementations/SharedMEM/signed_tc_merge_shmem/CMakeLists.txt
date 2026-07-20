@@ -1,0 +1,1 @@
+add_essentials_example(signed_tc_merge_shmem)
